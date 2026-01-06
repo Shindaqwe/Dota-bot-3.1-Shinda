@@ -1,7 +1,7 @@
 import os
+import re
 import logging
 import requests
-import json
 from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardMarkup, 
@@ -31,6 +31,9 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
     logger.error("❌ Не установлены все необходимые переменные окружения!")
     exit(1)
 
+if not STEAM_API_KEY:
+    logger.warning("⚠️ STEAM_API_KEY не установлен, обработка пользовательских ссылок будет недоступна")
+
 # Создаем клиент бота
 app = Client(
     "dotastats_bot",
@@ -48,6 +51,139 @@ def get_main_keyboard():
         ],
         resize_keyboard=True
     )
+
+def resolve_vanity_url(vanity_name):
+    """Использует Steam API для преобразования пользовательского URL в SteamID64"""
+    if not STEAM_API_KEY:
+        return None
+    
+    url = "http://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/"
+    params = {
+        'key': STEAM_API_KEY,
+        'vanityurl': vanity_name
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data['response']['success'] == 1:
+                return data['response']['steamid']
+    except Exception as e:
+        logger.error(f"Ошибка при разрешении vanity URL: {e}")
+    
+    return None
+
+def extract_steam_id(steam_input):
+    """Извлекает SteamID64 из различных форматов"""
+    
+    # 1. Цифровой SteamID64 (17 цифр)
+    if steam_input.isdigit():
+        if len(steam_input) == 17:
+            return steam_input
+        elif len(steam_input) in [8, 9, 10]:  # Account ID
+            account_id = int(steam_input)
+            return str(account_id + 76561197960265728)
+    
+    # 2. URL с цифровым ID
+    profile_match = re.search(r'steamcommunity\.com/profiles/(\d+)', steam_input)
+    if profile_match:
+        return profile_match.group(1)
+    
+    # 3. Пользовательский URL (нужен Steam API)
+    custom_match = re.search(r'steamcommunity\.com/id/([\w-]+)', steam_input)
+    if custom_match:
+        if not STEAM_API_KEY:
+            return None
+        return resolve_vanity_url(custom_match.group(1))
+    
+    return None
+
+async def get_player_stats(steam_input):
+    """Получает и форматирует статистику игрока"""
+    steam_id = extract_steam_id(steam_input)
+    
+    if not steam_id:
+        if 'steamcommunity.com/id/' in steam_input and not STEAM_API_KEY:
+            return "❌ Не удалось обработать пользовательскую ссылку.\nДобавьте STEAM_API_KEY в переменные окружения."
+        return "❌ Не удалось распознать Steam ID. Проверьте формат."
+    
+    try:
+        # Получаем основную информацию
+        player_url = f"https://api.opendota.com/api/players/{steam_id}"
+        player_response = requests.get(player_url, timeout=10)
+        
+        if player_response.status_code != 200:
+            return "❌ Игрок не найден или профиль скрыт (код: " + str(player_response.status_code) + ")"
+        
+        player_data = player_response.json()
+        
+        # Получаем винрейт
+        wl_url = f"https://api.opendota.com/api/players/{steam_id}/wl"
+        wl_response = requests.get(wl_url, timeout=10)
+        wl_data = wl_response.json() if wl_response.status_code == 200 else {"win": 0, "lose": 0}
+        
+        # Получаем последние матчи
+        matches_url = f"https://api.opendota.com/api/players/{steam_id}/recentMatches"
+        matches_response = requests.get(matches_url, timeout=10)
+        matches = matches_response.json() if matches_response.status_code == 200 else []
+        
+        # Форматируем ответ
+        profile = player_data.get("profile", {})
+        persona_name = profile.get("personaname", "Неизвестно")
+        mmr_estimate = player_data.get("mmr_estimate", {}).get("estimate", "Неизвестно")
+        
+        wins = wl_data.get("win", 0)
+        losses = wl_data.get("lose", 0)
+        total_matches = wins + losses
+        win_rate = (wins / total_matches * 100) if total_matches > 0 else 0
+        
+        text = f"👤 Игрок: {persona_name}\n"
+        text += f"🎯 Примерный MMR: {mmr_estimate}\n"
+        text += f"🔥 Винрейт: {win_rate:.1f}% ({wins}W - {losses}L)\n\n"
+        
+        if matches:
+            text += f"📊 Последние {min(5, len(matches))} игр:\n\n"
+            
+            # Получаем список всех героев один раз
+            heroes_response = requests.get("https://api.opendota.com/api/heroes", timeout=5)
+            heroes_map = {}
+            if heroes_response.status_code == 200:
+                heroes = heroes_response.json()
+                heroes_map = {hero['id']: hero['localized_name'] for hero in heroes}
+            
+            for match in matches[:5]:
+                player_slot = match.get("player_slot", 0)
+                radiant_win = match.get("radiant_win", False)
+                
+                # Определяем победу/поражение
+                if player_slot < 128:  # Radiant
+                    win = radiant_win
+                else:  # Dire
+                    win = not radiant_win
+                
+                hero_id = match.get("hero_id", 0)
+                hero_name = heroes_map.get(hero_id, f"Герой {hero_id}")
+                
+                kills = match.get("kills", 0)
+                deaths = match.get("deaths", 0)
+                assists = match.get("assists", 0)
+                duration = match.get("duration", 0)
+                
+                minutes = duration // 60
+                seconds = duration % 60
+                
+                text += f"{'✅' if win else '❌'} | {hero_name}\n"
+                text += f"📊 KDA: {kills}/{deaths}/{assists} | 🕒 {minutes}:{seconds:02d}\n"
+                text += "----------------------------\n"
+        
+        return text
+        
+    except requests.exceptions.Timeout:
+        return "⏱️ Таймаут при запросе к OpenDota. Попробуйте позже."
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+        return "⚠️ Произошла ошибка при получении статистики"
 
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client, message):
@@ -89,18 +225,28 @@ async def meta_heroes(client, message):
     await message.reply_text("🔄 Получаю информацию о мета-героях...")
     
     try:
-        response = requests.get("https://api.opendota.com/api/heroStats")
+        response = requests.get("https://api.opendota.com/api/heroStats", timeout=10)
         if response.status_code == 200:
             heroes = response.json()
             
-            # Фильтруем и сортируем
+            # Фильтруем героев с разумной популярностью (более 1% пиков)
+            # pick_rate здесь уже в процентах (например, 5.12 для 5.12%)
             popular_heroes = [
                 hero for hero in heroes 
-                if hero.get('pick_rate', 0) > 0.5
+                if hero.get('pick_rate', 0) > 1.0  # Исправлено: > 1% вместо > 0.5
             ]
+            
+            # Сортируем по популярности
             popular_heroes.sort(key=lambda x: x.get('pick_rate', 0), reverse=True)
             
             text = "🏆 Топ-5 популярных героев:\n\n"
+            
+            if not popular_heroes:
+                # Если почему-то фильтр оставил пустой список, покажем топ-5 всех героев
+                all_heroes_sorted = sorted(heroes, key=lambda x: x.get('pick_rate', 0), reverse=True)
+                popular_heroes = all_heroes_sorted[:5]
+                text = "🏆 Топ-5 героев по популярности:\n\n"
+            
             for i, hero in enumerate(popular_heroes[:5], 1):
                 name = hero.get('localized_name', 'Неизвестно')
                 pick_rate = hero.get('pick_rate', 0)
@@ -112,7 +258,7 @@ async def meta_heroes(client, message):
             
             await message.reply_text(text)
         else:
-            await message.reply_text("❌ Не удалось получить данные о героях")
+            await message.reply_text(f"❌ Не удалось получить данные о героях (код: {response.status_code})")
     except Exception as e:
         logger.error(f"Ошибка при получении меты: {e}")
         await message.reply_text("⚠️ Произошла ошибка при получении данных")
@@ -147,12 +293,12 @@ async def handle_steam_link(client, message):
         return
     
     # Проверяем, похоже ли на Steam ID
-    if 'steamcommunity.com' in text or (text.isdigit() and len(text) in [17, 8, 9, 10]):
+    if ('steamcommunity.com' in text) or (text.isdigit() and len(text) in [17, 8, 9, 10]):
         await message.reply_text(f"🔍 Обрабатываю запрос...\n\n⏳ Получаю данные...")
         
         try:
             # Получаем статистику
-            stats = await get_player_stats_simple(text)
+            stats = await get_player_stats(text)
             await message.reply_text(stats, reply_markup=get_main_keyboard())
                 
         except Exception as e:
@@ -167,115 +313,6 @@ async def handle_steam_link(client, message):
             "• 76561198012345678",
             reply_markup=get_main_keyboard()
         )
-
-def extract_steam_id_simple(text):
-    """Простой извлечение Steam ID"""
-    import re
-    
-    # Цифровой ID
-    if text.isdigit():
-        if len(text) == 17:  # SteamID64
-            return text
-        elif len(text) in [8, 9, 10]:  # Account ID
-            account_id = int(text)
-            return str(account_id + 76561197960265728)
-    
-    # URL
-    if 'steamcommunity.com' in text:
-        # Цифровой профиль
-        match = re.search(r'steamcommunity\.com/profiles/(\d+)', text)
-        if match:
-            return match.group(1)
-    
-    return text
-
-async def get_player_stats_simple(steam_input):
-    """Простое получение статистики"""
-    steam_id = extract_steam_id_simple(steam_input)
-    
-    if not steam_id or not steam_id.isdigit():
-        return "❌ Неверный формат Steam ID"
-    
-    try:
-        # Получаем основную информацию
-        player_url = f"https://api.opendota.com/api/players/{steam_id}"
-        player_response = requests.get(player_url, timeout=10)
-        
-        if player_response.status_code != 200:
-            return "❌ Игрок не найден или профиль скрыт"
-        
-        player_data = player_response.json()
-        
-        # Получаем винрейт
-        wl_url = f"https://api.opendota.com/api/players/{steam_id}/wl"
-        wl_response = requests.get(wl_url, timeout=10)
-        wl_data = wl_response.json() if wl_response.status_code == 200 else {"win": 0, "lose": 0}
-        
-        # Получаем последние матчи
-        matches_url = f"https://api.opendota.com/api/players/{steam_id}/recentMatches"
-        matches_response = requests.get(matches_url, timeout=10)
-        matches = matches_response.json() if matches_response.status_code == 200 else []
-        
-        # Формируем ответ
-        profile = player_data.get("profile", {})
-        persona_name = profile.get("personaname", "Неизвестно")
-        mmr_estimate = player_data.get("mmr_estimate", {}).get("estimate", "Неизвестно")
-        
-        wins = wl_data.get("win", 0)
-        losses = wl_data.get("lose", 0)
-        total_matches = wins + losses
-        win_rate = (wins / total_matches * 100) if total_matches > 0 else 0
-        
-        text = f"👤 Игрок: {persona_name}\n"
-        text += f"🎯 MMR: ~{mmr_estimate}\n"
-        text += f"🔥 Винрейт: {win_rate:.1f}% ({wins}W - {losses}L)\n\n"
-        
-        if matches:
-            text += f"📊 Последние {min(5, len(matches))} игр:\n\n"
-            
-            for match in matches[:5]:
-                player_slot = match.get("player_slot", 0)
-                radiant_win = match.get("radiant_win", False)
-                
-                # Определяем победу/поражение
-                if player_slot < 128:  # Radiant
-                    win = radiant_win
-                else:  # Dire
-                    win = not radiant_win
-                
-                hero_id = match.get("hero_id", 0)
-                kills = match.get("kills", 0)
-                deaths = match.get("deaths", 0)
-                assists = match.get("assists", 0)
-                duration = match.get("duration", 0)
-                
-                minutes = duration // 60
-                seconds = duration % 60
-                
-                # Получаем имя героя
-                hero_name = f"Герой {hero_id}"
-                try:
-                    heroes_response = requests.get("https://api.opendota.com/api/heroes", timeout=5)
-                    if heroes_response.status_code == 200:
-                        heroes = heroes_response.json()
-                        for hero in heroes:
-                            if hero.get("id") == hero_id:
-                                hero_name = hero.get("localized_name", f"Герой {hero_id}")
-                                break
-                except:
-                    pass
-                
-                text += f"{'✅' if win else '❌'} | {hero_name}\n"
-                text += f"📊 KDA: {kills}/{deaths}/{assists} | 🕒 {minutes}:{seconds:02d}\n"
-                text += "----------------------------\n"
-        
-        return text
-        
-    except requests.exceptions.Timeout:
-        return "⏱️ Таймаут при запросе к OpenDota. Попробуйте позже."
-    except Exception as e:
-        logger.error(f"Ошибка получения статистики: {e}")
-        return "⚠️ Произошла ошибка при получении статистики"
 
 if __name__ == "__main__":
     logger.info("🚀 Запуск DotaStats бота на Pyrogram...")
